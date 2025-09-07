@@ -7,13 +7,12 @@ import torch.nn.functional as F
 from collections import deque
 import time
 import threading
-import winsound  # Windows에서 소리 재생
+import winsound
+import mediapipe as mp
+from math import hypot
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -------------------------------
-# 모델 로드
-# -------------------------------
 model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 num_features = model.fc.in_features
 model.fc = nn.Linear(num_features, 2)
@@ -21,94 +20,107 @@ model.load_state_dict(torch.load("../models/last_epoch.pth", map_location=device
 model = model.to(device)
 model.eval()
 
-# -------------------------------
-# 이미지 전처리
-# -------------------------------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.5]*3, [0.5]*3)
 ])
 
-# -------------------------------
-# 얼굴 검출기
-# -------------------------------
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1)
+mp_draw = mp.solutions.drawing_utils
 
-# -------------------------------
-# 웹캠 실행
-# -------------------------------
+LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+
+def eye_aspect_ratio(landmarks, idx_list, w, h):
+    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in idx_list]
+    A = hypot(pts[1][0]-pts[5][0], pts[1][1]-pts[5][1])
+    B = hypot(pts[2][0]-pts[4][0], pts[2][1]-pts[4][1])
+    C = hypot(pts[0][0]-pts[3][0], pts[0][1]-pts[3][1])
+    ear = (A + B) / (2.0 * C)
+    return ear
+
 cap = cv2.VideoCapture(0)
 
-# 최근 프레임 Drowsy 확률 저장
-prob_queue = deque(maxlen=30)  # 약 1초치 프레임
+WINDOW_SIZE = 60 
+prob_queue = deque(maxlen=WINDOW_SIZE)
+ear_queue = deque(maxlen=WINDOW_SIZE)
 
-# Drowsy 판단 기준
-DROWSY_PROB_THRESHOLD = 0.5  # 평균 확률 0.5 이상이면 Drowsy
-ALARM_DURATION = 1000  # 소리 길이(ms)
-ALARM_FREQ = 1000     # 소리 주파수(Hz)
-DROWSY_TIME_THRESHOLD = 3.0  # 초 단위, 3초 이상일 때 알람
+DROWSY_PROB_THRESHOLD = 0.4
+EAR_THRESHOLD = 0.25
+DROWSY_TIME_THRESHOLD = 2.0
 
-# Drowsy 상태 지속 시간 체크
+DROWSY_ENTER_EAR = 0.22 
+DROWSY_EXIT_EAR = 0.25  
+
+current_state = "NonDrowsy"
 drowsy_start_time = None
-alarm_triggered = False  # 알람 중복 방지
+alarm_triggered = False
 
-# -------------------------------
-# 알람 함수 (쓰레드 사용)
-# -------------------------------
 def play_alarm():
-    winsound.Beep(ALARM_FREQ, ALARM_DURATION)
+    winsound.Beep(1000, 1000)
 
-# -------------------------------
-# 메인 루프
-# -------------------------------
 while True:
     ret, frame = cap.read()
     if not ret:
         break
+    h, w, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb_frame)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            left_ear = eye_aspect_ratio(face_landmarks.landmark, LEFT_EYE_IDX, w, h)
+            right_ear = eye_aspect_ratio(face_landmarks.landmark, RIGHT_EYE_IDX, w, h)
+            ear = (left_ear + right_ear) / 2.0
+            ear_queue.append(ear)
 
-    for (x, y, w, h) in faces:
-        face_img = frame[y:y+h, x:x+w]
-        face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(face_rgb)
-        img_tensor = transform(img_pil).unsqueeze(0).to(device)
+            x_min = min([int(lm.x * w) for lm in face_landmarks.landmark])
+            x_max = max([int(lm.x * w) for lm in face_landmarks.landmark])
+            y_min = min([int(lm.y * h) for lm in face_landmarks.landmark])
+            y_max = max([int(lm.y * h) for lm in face_landmarks.landmark])
+            face_img = frame[y_min:y_max, x_min:x_max]
+            face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(face_rgb)
+            img_tensor = transform(img_pil).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            output = model(img_tensor)
-            probs = F.softmax(output, dim=1)
-            prob_drowsy = probs[0, 0].item()
-            prob_queue.append(prob_drowsy)
+            with torch.no_grad():
+                output = model(img_tensor)
+                probs = F.softmax(output, dim=1)
+                prob_drowsy = probs[0,0].item()
+                prob_queue.append(prob_drowsy)
 
-        # 최근 프레임 평균 확률 계산
-        avg_prob = sum(prob_queue) / len(prob_queue)
-        current_time = time.time()
+            avg_prob = sum(prob_queue)/len(prob_queue)
+            avg_ear = sum(ear_queue)/len(ear_queue)
+            current_time = time.time()
 
-        if avg_prob >= DROWSY_PROB_THRESHOLD:
-            label = f"Drowsy ({avg_prob:.2f})"
-            if drowsy_start_time is None:
-                drowsy_start_time = current_time
-                alarm_triggered = False  # 새로운 Drowsy 시작
-            elapsed = current_time - drowsy_start_time
+            if current_state == "NonDrowsy":
+                is_drowsy_frame = (avg_prob >= DROWSY_PROB_THRESHOLD) or (avg_ear < DROWSY_ENTER_EAR)
+            else:  
+                is_drowsy_frame = (avg_prob >= DROWSY_PROB_THRESHOLD) or (avg_ear < DROWSY_EXIT_EAR)
 
-            # 3초 이상 지속 시 알람
-            if elapsed >= DROWSY_TIME_THRESHOLD and not alarm_triggered:
-                threading.Thread(target=play_alarm, daemon=True).start()
-                alarm_triggered = True
-        else:
-            label = f"NonDrowsy ({1-avg_prob:.2f})"
-            drowsy_start_time = None
-            alarm_triggered = False
+            if is_drowsy_frame:
+                if current_state == "NonDrowsy":
+                    drowsy_start_time = current_time 
+                    current_state = "Drowsy"
+                    alarm_triggered = False
+                elif current_state == "Drowsy":
+                    elapsed = current_time - drowsy_start_time
+                    if elapsed >= DROWSY_TIME_THRESHOLD and not alarm_triggered:
+                        threading.Thread(target=play_alarm, daemon=True).start()
+                        alarm_triggered = True
+            else:
+                current_state = "NonDrowsy"
+                drowsy_start_time = None
+                alarm_triggered = False
 
-        # 얼굴 표시
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            label = f"{current_state} (P:{avg_prob:.2f}, EAR:{avg_ear:.2f})"
 
-    cv2.imshow("WakeUp Test (Face Only)", frame)
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0,255,0), 2)
+            cv2.putText(frame, label, (x_min, y_min-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255),2)
 
+    cv2.imshow("WakeUp Drowsy Detection", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
