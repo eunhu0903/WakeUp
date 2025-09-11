@@ -5,13 +5,14 @@ from app.core.security import (
     create_access_token, 
     get_password_hash
 )
+from app.core.security import create_access_token, verify_password
 from app.core.database import get_db
 from app.models.auth import User
-from app.schemas.auth import UserCreate, Token
+from app.schemas.auth import UserCreate, UserResponse, UserLogin, Token
 
 router = APIRouter()
 
-@router.post("/signup", response_model=Token, tags=["Auth"])
+@router.post("/signup", response_model=UserResponse, tags=["Auth"])
 def signup(user: UserCreate, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(or_(User.username == user.username, User.email == user.email)).first()
 
@@ -28,6 +29,4 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
 
-    access_token = create_access_token(user_id=new_user.id)
-
-    return {"access_token": access_token, "token_type": "bearer"}
+    return new_user
