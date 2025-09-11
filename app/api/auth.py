@@ -30,3 +30,17 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
 
     return new_user
+
+@router.post("/login", response_model=Token, tags=["Auth"])
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=400, detail="잘못된 이메일 또는 비밀번호 입니다.")
+    
+    if not db_user.is_active:
+        raise HTTPException(status_code=403, detail="이 계정은 정지되었습니다.")
+    
+    access_token = create_access_token(user_id=db_user.id)
+
+    return {"access_token": access_token, "token_type": "Bearer"}
